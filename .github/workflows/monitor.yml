@@ -1,0 +1,37 @@
+name: Intraday Stock Monitor
+
+on:
+  schedule:
+    # 週一至週五，UTC 01:00 至 05:30（台灣 09:00~13:30），每 15 分鐘執行一次
+    - cron: '*/15 1-5 * * 1-5'
+  workflow_dispatch: # 支援在 GitHub 網頁上手動按按鈕測試執行
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 檢出專案代碼
+        uses: actions/checkout@v4
+
+      - name: 設定 Python 環境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安裝相依套件
+        run: pip install -r requirements.txt
+
+      - name: 執行盤中訊號檢查
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python -c "import swing_monitor; swing_monitor.check_intraday_signals()"
+
+      - name: 將最新資料庫紀錄存回 GitHub
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add trading_journal.db
+          git commit -m "Auto-update trading journal [skip ci]" || echo "No changes to commit"
+          git push
