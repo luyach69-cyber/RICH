@@ -9,6 +9,8 @@ on:
 jobs:
   monitor:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # <-- 加入這一行，明確賦予代碼寫入權限
     steps:
       - name: 檢出專案代碼
         uses: actions/checkout@v4
