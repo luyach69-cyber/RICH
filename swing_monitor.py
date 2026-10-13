@@ -10,7 +10,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 DB_NAME = "trading_journal.db"
 
-# 預設基礎追蹤清單 (萬一網路異常抓不到證交所時的備用池)
+# 備用觀察池
 FALLBACK_WATCHLIST = {
     "2330.TW": "台積電",
     "2317.TW": "鴻海",
@@ -20,6 +20,47 @@ FALLBACK_WATCHLIST = {
     "2603.TW": "長榮",
     "3037.TW": "欣興",
 }
+
+
+# ================= 升降單位 (Tick) 與交易價格計算 =================
+def get_tw_tick_size(price: float) -> float:
+    """計算台股最小跳動檔位 (Tick Size)"""
+    if price < 10:
+        return 0.01
+    elif price < 50:
+        return 0.05
+    elif price < 100:
+        return 0.1
+    elif price < 500:
+        return 0.5
+    elif price < 1000:
+        return 1.0
+    else:
+        return 5.0
+
+
+def calculate_trade_levels(entry_price: float, stop_price: float):
+    """
+    計算建議防守停損與兩階段停利目標
+    """
+    # 限制單筆最大止損不超過 5.5% (避免昨低過深)
+    max_risk_stop = entry_price * 0.945
+    actual_stop = max(stop_price, max_risk_stop)
+
+    risk = entry_price - actual_stop
+    risk_pct = (risk / entry_price) * 100
+
+    # 目標一 (1.5 倍盈虧比)、目標二 (3.0 倍盈虧比)
+    tp1 = entry_price + (risk * 1.5)
+    tp2 = entry_price + (risk * 3.0)
+
+    return {
+        "entry": round(entry_price, 2),
+        "stop": round(actual_stop, 2),
+        "risk_pct": round(risk_pct, 2),
+        "tp1": round(tp1, 2),
+        "tp2": round(tp2, 2),
+    }
 
 
 # ================= 推播工具函式 =================
@@ -49,7 +90,6 @@ def init_db():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
 
-    # 1. 歷史觸發訊號表
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS signal_logs (
@@ -66,7 +106,6 @@ def init_db():
     """
     )
 
-    # 2. 目前持股部位 (跌破昨低警示)
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS positions (
@@ -79,14 +118,17 @@ def init_db():
     """
     )
 
-    # 3. 盤後選出之「動態觀察池」(供次日盤中監控)
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS watchlist_dynamic (
             symbol TEXT PRIMARY KEY,
             name TEXT,
             added_date TEXT,
-            neckline_price REAL
+            neckline_price REAL,
+            suggested_entry REAL,
+            suggested_stop REAL,
+            tp1 REAL,
+            tp2 REAL
         )
     """
     )
@@ -95,7 +137,6 @@ def init_db():
 
 
 def has_alerted_today(symbol, signal_type):
-    """防止盤中相同訊號重複轟炸"""
     conn = sqlite3.connect(DB_NAME)
     today_str = datetime.now().strftime("%Y-%m-%d")
     cursor = conn.cursor()
@@ -134,9 +175,8 @@ def log_signal(symbol, signal_type, price, yesterday_low, yesterday_high, volume
     conn.close()
 
 
-# ================= 證交所全市場股票清單抓取 =================
+# ================= 證交所全市場名冊抓取 =================
 def fetch_twse_stock_universe() -> dict:
-    """從證交所開放資料 API 取得所有上市股票代碼與名稱"""
     stock_dict = {}
     try:
         url = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L"
@@ -146,23 +186,16 @@ def fetch_twse_stock_universe() -> dict:
             for item in data:
                 code = str(item.get("公司代號", "")).strip()
                 name = str(item.get("公司名稱", "")).strip() or str(item.get("公司簡稱", "")).strip()
-                # 僅保留一般 4 位數代號普通股 (過濾特別股、ETF 00xxx 等)
                 if len(code) == 4 and code.isdigit():
                     stock_dict[f"{code}.TW"] = name
     except Exception as e:
-        print(f"從證交所 API 讀取股票名冊失敗: {e}")
+        print(f"證交所 API 讀取異常: {e}")
 
-    # 若失敗則回傳預設池
     return stock_dict if stock_dict else FALLBACK_WATCHLIST
 
 
-# ================= 盤後全市場掃描 (型態收斂 + 準備突破) =================
+# ================= 盤後全市場掃描 (附精確買賣與停損停利點) =================
 def scan_market_and_update_watchlist():
-    """
-    每日盤後 15:30 執行：
-    掃描全市場股票，挑出符合「均線多頭 + 整理收斂即將過頸線」的標的，
-    推播至 Telegram 並自動存入 watchlist_dynamic 供隔日監控。
-    """
     init_db()
     stocks = fetch_twse_stock_universe()
     all_symbols = list(stocks.keys())
@@ -171,7 +204,6 @@ def scan_market_and_update_watchlist():
     selected_candidates = []
     today_str = datetime.now().strftime("%Y-%m-%d")
 
-    # 批次下載以節省時間 (每批 60 檔)
     batch_size = 60
     for i in range(0, len(all_symbols), batch_size):
         batch = all_symbols[i : i + batch_size]
@@ -192,7 +224,6 @@ def scan_market_and_update_watchlist():
                     if len(df) < 35:
                         continue
 
-                    # 指標計算
                     df["MA5"] = df["Close"].rolling(5).mean()
                     df["MA10"] = df["Close"].rolling(10).mean()
                     df["MA20"] = df["Close"].rolling(20).mean()
@@ -205,12 +236,13 @@ def scan_market_and_update_watchlist():
                     curr_price = float(latest["Close"])
                     curr_vol = float(latest["Volume"])
                     vol_ma5 = float(latest["Vol_MA5"])
+                    curr_low = float(latest["Low"])
 
-                    # 1. 流動性篩選：單日成交量 >= 2,000 張 (2,000,000 股)
+                    # 1. 流動性過濾 (>= 2,000 張)
                     if curr_vol < 2000000:
                         continue
 
-                    # 2. 均線架構：多頭排列且站穩月季線 (5MA > 10MA > 20MA 且 Close > 20MA, 60MA)
+                    # 2. 均線多頭且站上月季線
                     is_bull = (
                         latest["MA5"] > latest["MA10"] > latest["MA20"]
                         and curr_price > latest["MA20"]
@@ -219,15 +251,20 @@ def scan_market_and_update_watchlist():
                     if not is_bull:
                         continue
 
-                    # 3. 型態學整理區頸線計算：過去 20 天的高點 (不含當日)
+                    # 3. 整理區頸線計算 (前 20 日高點)
                     recent_high = float(df["High"].iloc[-21:-1].max())
 
-                    # 4. 突破或臨近突破 (距離頸線高點 -2% 到 +2% 之間，或量增過頸線)
+                    # 4. 突破或臨近突破
                     pct_to_high = (curr_price - recent_high) / recent_high
                     is_near_breakout = -0.02 <= pct_to_high <= 0.02
                     is_breakout_today = (curr_price >= recent_high) and (curr_vol > vol_ma5 * 1.5)
 
                     if is_near_breakout or is_breakout_today:
+                        # 計算隔日建議突破價與各防守目標點位
+                        tick = get_tw_tick_size(recent_high)
+                        suggested_entry = recent_high + tick if not is_breakout_today else curr_price
+                        trade_plan = calculate_trade_levels(suggested_entry, curr_low)
+
                         selected_candidates.append({
                             "symbol": sym,
                             "name": stocks.get(sym, sym),
@@ -236,84 +273,81 @@ def scan_market_and_update_watchlist():
                             "volume": curr_vol,
                             "vol_ratio": curr_vol / vol_ma5 if vol_ma5 > 0 else 1.0,
                             "status": "今日已突破" if is_breakout_today else "臨近頸線蓄勢",
+                            "plan": trade_plan,
                         })
                 except Exception:
                     continue
         except Exception as e:
-            print(f"批次下載異常: {e}")
+            print(f"批次掃描異常: {e}")
 
-    # 排序：按量比與型態優先度排序，取前 8 檔精華
+    # 取量比最大的前 6 檔標的
     selected_candidates.sort(key=lambda x: x["vol_ratio"], reverse=True)
-    top_candidates = selected_candidates[:8]
+    top_candidates = selected_candidates[:6]
 
-    # 更新資料庫 watchlist_dynamic
+    # 存入資料庫
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM watchlist_dynamic")  # 清空舊清單
+    cursor.execute("DELETE FROM watchlist_dynamic")
     for c in top_candidates:
+        p = c["plan"]
         cursor.execute(
             """
-            INSERT OR REPLACE INTO watchlist_dynamic (symbol, name, added_date, neckline_price)
-            VALUES (?, ?, ?, ?)
+            INSERT OR REPLACE INTO watchlist_dynamic 
+            (symbol, name, added_date, neckline_price, suggested_entry, suggested_stop, tp1, tp2)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-            (c["symbol"], c["name"], today_str, c["neckline"]),
+            (c["symbol"], c["name"], today_str, c["neckline"], p["entry"], p["stop"], p["tp1"], p["tp2"]),
         )
     conn.commit()
     conn.close()
 
-    # 發送 Telegram 盤後選股名單報告
     if not top_candidates:
-        send_telegram_alert(f"📋 *【盤後全市場掃描 - {today_str}】*\n今日市場無符合「均線多頭＋頸線突破」之標的。")
+        send_telegram_alert(f"📋 *【盤後全市場掃描 - {today_str}】*\n今日市場無符合標準之標的。")
         return
 
+    # 發送包含停損停利價的完整報告
     msg = (
-        f"🎯 *【明日突破潛力觀察池 (盤後全市場篩選)】*\n"
-        f"日期：`{today_str}` | 共篩選出 `{len(top_candidates)}` 檔\n"
+        f"🎯 *【明日突破潛力觀察池 (附進出場價格)】*\n"
+        f"日期：`{today_str}` | 共精選 `{len(top_candidates)}` 檔\n"
         f"------------------------------------\n"
     )
     for c in top_candidates:
+        p = c["plan"]
         msg += (
             f"📌 *{c['name']}* (`{c['symbol']}`)\n"
-            f"• 狀態：`{c['status']}`\n"
-            f"• 收盤價：`{c['price']:.2f}`\n"
-            f"• 關鍵頸線：`{c['neckline']:.2f}`\n"
+            f"• 型態狀態：`{c['status']}`\n"
+            f"• 今日收盤：`{c['price']:.2f}`\n"
+            f"• 🟢 **建議進場價**：`{p['entry']:.2f}` (過頸線觸發)\n"
+            f"• 🔴 **建議停損價**：`{p['stop']:.2f}` (風險約 `-{p['risk_pct']}%`)\n"
+            f"• 🎯 **停利目標一**：`{p['tp1']:.2f}` (盈虧比 1.5x)\n"
+            f"• 🚀 **波段目標二**：`{p['tp2']:.2f}` (盈虧比 3.0x)\n"
             f"• 今日成交量：`{int(c['volume']):,}` (量增 `{c['vol_ratio']:.1f}x`)\n\n"
         )
-    msg += "💡 *實戰提示*：上述標的已自動加入次日盤中監控池。建議明早可於券商 App 針對上述個股設定「觸價買進單（過頸線觸發）」。"
+    msg += "💡 *操作紀律*：明早可於券商 App 針對上述標的設定「觸價買進單（價格 >= 建議進場價）」，成交後請立即掛出防守停損單！"
     send_telegram_alert(msg)
 
 
-# ================= 盤中訊號篩選 (即時監控持股與動態觀察池) =================
+# ================= 盤中即時訊號 (推播精確進場與停損停利) =================
 def check_intraday_signals():
     init_db()
     conn = sqlite3.connect(DB_NAME)
-    
-    # 讀取持股
     active_positions = pd.read_sql("SELECT * FROM positions WHERE status = 'HOLD'", conn)
     holding_symbols = active_positions["symbol"].tolist() if not active_positions.empty else []
 
-    # 讀取盤後自動篩選出的動態觀察池
     dynamic_watch = pd.read_sql("SELECT * FROM watchlist_dynamic", conn)
     conn.close()
 
-    # 合併監控池 (動態觀察池 + 預設權值池)
     current_watchlist = dict(FALLBACK_WATCHLIST)
     if not dynamic_watch.empty:
         for _, row in dynamic_watch.iterrows():
             current_watchlist[row["symbol"]] = row["name"]
 
     now_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{now_time_str}] 執行盤中監控，監控檔數：{len(current_watchlist)} 檔...")
+    print(f"[{now_time_str}] 盤中監控檢查中...")
 
     for symbol, stock_name in current_watchlist.items():
         try:
-            df = yf.download(
-                symbol,
-                period="3mo",
-                interval="1d",
-                progress=False,
-                auto_adjust=True,
-            )
+            df = yf.download(symbol, period="3mo", interval="1d", progress=False, auto_adjust=True)
             if df.empty or len(df) < 25:
                 continue
 
@@ -342,28 +376,31 @@ def check_intraday_signals():
                             f"🚨 *【手動停損/停利警示 - 跌破昨低】*\n"
                             f"• 標的：`{stock_name} ({symbol})`\n"
                             f"• 最新成交價：`{curr_price:.2f}`\n"
-                            f"• 昨日最低點：`{prev_low:.2f}`\n"
+                            f"• 昨低防守線：`{prev_low:.2f}`\n"
                             f"• 觸發時間：`{now_time_str}`\n"
-                            f"• 處置方式：已跌破短線防守點，建議手動掛單退場。"
+                            f"• 處置方式：已跌破防守線，建議手動掛單賣出，截斷虧損[cite: 4]！"
                         )
                         send_telegram_alert(msg)
                         log_signal(symbol, "SELL_SIGNAL", curr_price, prev_low, prev_high, curr_vol, "跌破前日低點")
                 continue
 
-            # ---------------- 條件 B：觀察池帶量過昨高突破 ----------------
+            # ---------------- 條件 B：空手帶量突破買進 ----------------
             is_bull_trend = latest["MA5"] > latest["MA10"] > latest["MA20"]
             is_breakout = curr_price > prev_high
             is_volume_spike = curr_vol > (avg_vol * 1.5)
 
             if is_bull_trend and is_breakout and is_volume_spike:
                 if not has_alerted_today(symbol, "BUY_SIGNAL"):
+                    trade_plan = calculate_trade_levels(curr_price, prev_low)
                     msg = (
                         f"🔥 *【手動買進訊號 - 帶量突破】*\n"
                         f"• 標的：`{stock_name} ({symbol})`\n"
-                        f"• 現價：`{curr_price:.2f}` (突破昨高 `{prev_high:.2f}`)\n"
-                        f"• 今日成交量：`{int(curr_vol):,}` (大於 5 日均量 1.5 倍)\n"
-                        f"• 停損防守線：`{prev_low:.2f}` (昨日低點)\n"
-                        f"• 處置建議：符合突破買點，請評估建倉並掛出停損單。"
+                        f"• 🟢 **建議進場價**：`{trade_plan['entry']:.2f}` (現價過昨高 `{prev_high:.2f}`)\n"
+                        f"• 🔴 **嚴格停損價**：`{trade_plan['stop']:.2f}` (昨低防守，風險 `-{trade_plan['risk_pct']}%`)[cite: 4]\n"
+                        f"• 🎯 **停利目標一**：`{trade_plan['tp1']:.2f}` (盈虧比 1.5x)\n"
+                        f"• 🚀 **波段目標二**：`{trade_plan['tp2']:.2f}` (盈虧比 3.0x)\n"
+                        f"• 今日成交量：`{int(curr_vol):,}` (均量 `{int(avg_vol):,}`)\n"
+                        f"• 處置方式：若手動進場，請同步掛出 `{trade_plan['stop']:.2f}` 停損單[cite: 4]！"
                     )
                     send_telegram_alert(msg)
                     log_signal(symbol, "BUY_SIGNAL", curr_price, prev_low, prev_high, curr_vol, "帶量過昨高突破")
@@ -405,5 +442,4 @@ def daily_review_and_report():
 
 if __name__ == "__main__":
     init_db()
-    # 測試執行盤後全市場選股
     scan_market_and_update_watchlist()
